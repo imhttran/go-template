@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs on every commit once activated (see manage.sh option 8, or run
+# `git config core.hooksPath .githooks` yourself). Fast checks only — no
+# frontend e2e here, that needs live dev servers.
+set -e
+
+echo "→ backend unit tests"
+(cd backend && npm test)
+
+echo "→ prettier check"
+npx prettier --check . --ignore-path .gitignore

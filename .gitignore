@@ -1,0 +1,7 @@
+node_modules/
+*.db
+*.pid
+test-results/
+.env
+.playwright-mcp/
+*.png
