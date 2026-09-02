@@ -11,7 +11,10 @@ import (
 )
 
 //go:embed migrations/001_init.sql
-var schemaSQL string
+var initSQL string
+
+//go:embed migrations/002_2fa.sql
+var twoFASQL string
 
 func main() {
 	loadEnvFiles()
@@ -36,7 +39,17 @@ func main() {
 	}
 }
 
-// One embedded SQL migration, applied at boot and recorded in schema_migrations.
+// Ordered migrations; each runs once, recorded by version in schema_migrations.
+var migrations = []struct {
+	version int
+	name    string
+	sql     string
+}{
+	{1, "001_init.sql", initSQL},
+	{2, "002_2fa.sql", twoFASQL},
+}
+
+// Applied at boot and recorded in schema_migrations.
 func migrate(ctx context.Context) {
 	if _, err := db.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -45,25 +58,28 @@ func migrate(ctx context.Context) {
 		)`); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
-	var applied bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&applied); err != nil {
-		log.Fatalf("migrate: %v", err)
-	}
-	if applied {
-		return
-	}
 	// pgx's extended protocol rejects multi-statement strings; strip comment
 	// lines (they can contain semicolons), then run one statement at a time.
-	for _, stmt := range splitStatements(schemaSQL) {
-		if _, err := db.Exec(ctx, stmt); err != nil {
+	for _, m := range migrations {
+		var applied bool
+		if err := db.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, m.version).Scan(&applied); err != nil {
 			log.Fatalf("migrate: %v", err)
 		}
+		if applied {
+			continue
+		}
+		for _, stmt := range splitStatements(m.sql) {
+			if _, err := db.Exec(ctx, stmt); err != nil {
+				log.Fatalf("migrate: %v", err)
+			}
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO schema_migrations (version) VALUES ($1)`, m.version); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+		log.Printf("[migrate] applied %s", m.name)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES (1)`); err != nil {
-		log.Fatalf("migrate: %v", err)
-	}
-	log.Println("[migrate] applied 001_init.sql")
 }
 
 func splitStatements(sqlText string) []string {

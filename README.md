@@ -21,7 +21,12 @@ PostgreSQL     migrations apply on boot
 ```
 
 Needs Go 1.22+, Node 20+, and a running PostgreSQL (option 1 refuses to start
-if it's down). Dev admin: **admin@mail.com** / **Password1234!**.
+if it's down). Dev admin: **admin@mail.com** / **Password1234!** — first login
+from a new browser asks for a 2FA code; in development it's always `1234`, and
+the browser is trusted afterwards.
+
+Useful menu options beyond setup/start: [5] status, [6] tests, [9] reset DB,
+[10] tail logs, [11] re-seed (drop DB + restart backend).
 
 ## Docs
 
@@ -45,4 +50,11 @@ cd backend && go run ./cmd/set-role you@email.com admin
 
 ## API
 
-17 endpoints under `/api/*` — see `backend/app.go` (`routes()`).
+19 endpoints under `/api/*` — see `backend/app.go` (`routes()`):
+
+- **Public auth** (8): signup, verify, resend-verification, forgot-password,
+  reset-password, login, login/verify (2FA code), login/resend (2FA code)
+- **Self-service, any signed-in user** (4): me, profile (get/save),
+  change-password
+- **Staff/admin** (7): list users, create user, delete, verify/unverify,
+  change role, resend verification, reset password

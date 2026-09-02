@@ -1,7 +1,8 @@
 # Features
 
 - **Auth** — JWT login, scrypt password hashing, email verification, password
-  reset, resend-verification, self-service change-password
+  reset, resend-verification, self-service change-password, email-code 2FA on
+  new devices (trusted devices skip it)
 - **RBAC** — `client` < `staff` < `admin` roles with role-gated routes;
   promotion is CLI-only so there's no self-service escalation
 - **Onboarding gates** — forced password change and required profile block

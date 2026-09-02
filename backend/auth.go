@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -287,6 +289,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
+		DeviceID string `json:"deviceId"`
 	}
 	decodeJSON(r, &body)
 	var id int
@@ -303,12 +306,156 @@ func login(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusForbidden, fail(http.StatusForbidden, "Please verify your email before logging in."))
 		return
 	}
+	// Trusted device? Skip 2FA.
+	if body.DeviceID != "" {
+		var known bool
+		if err := db.QueryRow(r.Context(),
+			`SELECT EXISTS (SELECT 1 FROM user_devices WHERE user_id = $1 AND device_id = $2)`, id, body.DeviceID).Scan(&known); err == nil && known {
+			respond(w, http.StatusOK, map[string]any{
+				"success": true,
+				"message": "Login successful!",
+				"token":   issueToken(body.Email),
+				"user":    map[string]any{"email": body.Email},
+			})
+			return
+		}
+	}
+	// New device — require 2FA: queue an emailed code and hand back a pending
+	// token; the real JWT is only issued by /api/login/verify.
+	token := randomToken()
+	code := randomCode()
+	if _, err := db.Exec(r.Context(), `
+		INSERT INTO login_codes (user_id, token, code, expires_at)
+		VALUES ($1, $2, $3, now() + interval '10 minutes')`, id, token, code); err != nil {
+		respond500(w, "Login Error", err, false)
+		return
+	}
+	sendLoginCode(r.Context(), body.Email, code)
+	respond(w, http.StatusOK, map[string]any{
+		"success":           true,
+		"twoFactorRequired": true,
+		"token":             token,
+		"message":           "Enter the code sent to your device",
+	})
+}
+
+// Completes a 2FA login: validates the code, issues the real JWT, and
+// registers the device so future logins from it skip 2FA.
+func verifyLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token    string `json:"token"`
+		Code     string `json:"code"`
+		DeviceID string `json:"deviceId"`
+	}
+	decodeJSON(r, &body)
+	var userID int
+	var code, email string
+	var expiresAt time.Time
+	var used bool
+	var attempts int
+	err := db.QueryRow(r.Context(), `
+		SELECT lc.user_id, lc.code, lc.expires_at, lc.used, lc.attempts, u.email
+		FROM login_codes lc JOIN users u ON u.id = lc.user_id
+		WHERE lc.token = $1`, body.Token).
+		Scan(&userID, &code, &expiresAt, &used, &attempts, &email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respond(w, http.StatusBadRequest, fail(http.StatusBadRequest, "Invalid or expired code"))
+		return
+	}
+	if err != nil {
+		respond500(w, "Verify Login Error", err, false)
+		return
+	}
+	// Lock the code after a handful of failed tries so a 4-digit code can't be
+	// brute-forced within its 10-minute window.
+	if used || time.Now().After(expiresAt) || attempts >= 5 {
+		respond(w, http.StatusBadRequest, fail(http.StatusBadRequest, "Invalid or expired code"))
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(code), []byte(body.Code)) != 1 {
+		_, _ = db.Exec(r.Context(),
+			`UPDATE login_codes SET attempts = attempts + 1 WHERE token = $1`, body.Token)
+		respond(w, http.StatusBadRequest, fail(http.StatusBadRequest, "Invalid or expired code"))
+		return
+	}
+	if _, err := db.Exec(r.Context(),
+		`UPDATE login_codes SET used = true WHERE token = $1`, body.Token); err != nil {
+		respond500(w, "Verify Login Error", err, false)
+		return
+	}
+	if body.DeviceID != "" {
+		_, _ = db.Exec(r.Context(),
+			`INSERT INTO user_devices (user_id, device_id) VALUES ($1, $2) ON CONFLICT (device_id) DO NOTHING`,
+			userID, body.DeviceID)
+	}
 	respond(w, http.StatusOK, map[string]any{
 		"success": true,
 		"message": "Login successful!",
-		"token":   issueToken(body.Email),
-		"user":    map[string]any{"email": body.Email},
+		"token":   issueToken(email),
+		"user":    map[string]any{"email": email},
 	})
+}
+
+// Resends the 2FA code for a pending login, up to 3 times.
+func resendLoginCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	decodeJSON(r, &body)
+	var resends int
+	var email string
+	var expiresAt time.Time
+	var used bool
+	err := db.QueryRow(r.Context(), `
+		SELECT lc.resends, lc.expires_at, lc.used, u.email
+		FROM login_codes lc JOIN users u ON u.id = lc.user_id
+		WHERE lc.token = $1`, body.Token).
+		Scan(&resends, &expiresAt, &used, &email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respond(w, http.StatusBadRequest, fail(http.StatusBadRequest, "Invalid or expired code"))
+		return
+	}
+	if err != nil {
+		respond500(w, "Resend Code Error", err, false)
+		return
+	}
+	if used || time.Now().After(expiresAt) {
+		respond(w, http.StatusBadRequest, fail(http.StatusBadRequest, "Invalid or expired code"))
+		return
+	}
+	if resends >= 3 {
+		respond(w, http.StatusTooManyRequests, fail(http.StatusTooManyRequests, "Too many resend attempts"))
+		return
+	}
+	code := randomCode()
+	if _, err := db.Exec(r.Context(), `
+		UPDATE login_codes SET code = $1, resends = resends + 1, expires_at = now() + interval '10 minutes'
+		WHERE token = $2`, code, body.Token); err != nil {
+		respond500(w, "Resend Code Error", err, false)
+		return
+	}
+	sendLoginCode(r.Context(), email, code)
+	respond(w, http.StatusOK, msg("Code resent"))
+}
+
+// A 4-digit login code. In development it's always 1234 so testing doesn't
+// need a mail server; otherwise a random code.
+func randomCode() string {
+	if cfg.Env == "development" {
+		return "1234"
+	}
+	b := make([]byte, 2)
+	_, _ = rand.Read(b)
+	n := int(b[0])<<8 | int(b[1])
+	return fmt.Sprintf("%04d", n%10000)
+}
+
+// Emails the 2FA code through the shared queue; the worker delivers it.
+func sendLoginCode(ctx context.Context, email, code string) {
+	row := loginCodeEmail(email, code)
+	_, _ = db.Exec(ctx,
+		`INSERT INTO email_queue ("to", subject, body) VALUES ($1, $2, $3)`,
+		row.To, row.Subject, row.Body)
 }
 
 // Authenticated self-service password change. Used both for the general

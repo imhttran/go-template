@@ -157,6 +157,8 @@ func newRouter() http.Handler {
 		r.Post("/forgot-password", forgotPassword)
 		r.Post("/reset-password", resetPassword)
 		r.Post("/login", login)
+		r.Post("/login/verify", verifyLogin)
+		r.Post("/login/resend", resendLoginCode)
 
 		r.Group(func(r chi.Router) {
 			r.Use(requireAuth)

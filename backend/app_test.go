@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -47,22 +48,24 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	return testPool
 }
 
-// Same migration main() runs, applied for tests too.
+// Same migrations main() runs, applied for tests too.
 func ensureTestSchema(pool *pgxpool.Pool) {
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`)
-	var applied bool
-	_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&applied)
-	if applied {
-		return
-	}
-	for _, stmt := range splitStatements(schemaSQL) {
-		if _, err := pool.Exec(ctx, stmt); err != nil {
-			panic(err)
+	for _, m := range migrations {
+		var applied bool
+		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, m.version).Scan(&applied)
+		if applied {
+			continue
 		}
+		for _, stmt := range splitStatements(m.sql) {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				panic(err)
+			}
+		}
+		_, _ = pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, m.version)
 	}
-	_, _ = pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES (1)`)
 }
 
 // Boots a fresh router + httptest server with dev-like config, and seeds a
@@ -137,7 +140,35 @@ func loginAs(t *testing.T, server *httptest.Server, email, password string) stri
 	if token == "" {
 		t.Fatalf("login for %s returned no token", email)
 	}
+	if twoFA, _ := body["twoFactorRequired"].(bool); twoFA {
+		status, body = doJSON(t, server, http.MethodPost, "/api/login/verify", "",
+			map[string]string{"token": token, "code": fetchLoginCode(t, email), "deviceId": "test-device"})
+		if status != http.StatusOK {
+			t.Fatalf("2FA verify for %s failed (status %d)", email, status)
+		}
+		token, _ = body["token"].(string)
+		if token == "" {
+			t.Fatalf("2FA verify for %s returned no token", email)
+		}
+	}
 	return token
+}
+
+// Pulls the newest queued email for the address and extracts the 4-digit
+// login code from its body (the worker isn't running in tests).
+func fetchLoginCode(t *testing.T, email string) string {
+	t.Helper()
+	var bodyText string
+	err := testPool.QueryRow(context.Background(),
+		`SELECT body FROM email_queue WHERE "to" = $1 ORDER BY id DESC LIMIT 1`, email).Scan(&bodyText)
+	if err != nil {
+		t.Fatalf("fetch login code email: %v", err)
+	}
+	code := regexp.MustCompile(`\b\d{4}\b`).FindString(bodyText)
+	if code == "" {
+		t.Fatalf("no 4-digit code in queued email: %q", bodyText)
+	}
+	return code
 }
 
 // Sets a user's role directly in the store, like the Node tests do.
@@ -295,5 +326,67 @@ func TestPatchRoleInvalidValue(t *testing.T) {
 	}
 	if body["message"] != "role must be one of: client, staff, admin" {
 		t.Fatalf("message = %v", body["message"])
+	}
+}
+
+// Full 2FA flow: new-device login demands a code, wrong codes are rejected
+// (and locked after 5), the emailed code yields a real JWT, the device is
+// trusted from then on, and resend rotates the code.
+func TestTwoFactorLogin(t *testing.T) {
+	server, email, password := newTestEnv(t)
+	defer cleanupUser(t, email)
+
+	status, _ := doJSON(t, server, http.MethodPost, "/api/signup", "", map[string]string{"email": email, "password": password})
+	if status != http.StatusCreated {
+		t.Fatalf("signup: status %d", status)
+	}
+
+	// First login from an unknown device → 2FA required, no real JWT.
+	status, body := doJSON(t, server, http.MethodPost, "/api/login", "",
+		map[string]string{"email": email, "password": password, "deviceId": "dev-1"})
+	if status != http.StatusOK || body["twoFactorRequired"] != true {
+		t.Fatalf("login: status %d, body %v", status, body)
+	}
+	pending, _ := body["token"].(string)
+	if pending == "" {
+		t.Fatalf("2FA login returned no pending token: %v", body)
+	}
+
+	// Wrong code → 400, and the code stays pending.
+	status, _ = doJSON(t, server, http.MethodPost, "/api/login/verify", "",
+		map[string]string{"token": pending, "code": "0000", "deviceId": "dev-1"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("wrong code: status %d, want 400", status)
+	}
+
+	// Resend rotates the code; the newest queued email wins.
+	status, _ = doJSON(t, server, http.MethodPost, "/api/login/resend", "", map[string]string{"token": pending})
+	if status != http.StatusOK {
+		t.Fatalf("resend: status %d", status)
+	}
+
+	// Correct (resent) code → real JWT that works on /api/me.
+	status, body = doJSON(t, server, http.MethodPost, "/api/login/verify", "",
+		map[string]string{"token": pending, "code": fetchLoginCode(t, email), "deviceId": "dev-1"})
+	if status != http.StatusOK {
+		t.Fatalf("verify: status %d, body %v", status, body)
+	}
+	token, _ := body["token"].(string)
+	if token == "" || token == pending {
+		t.Fatalf("verify returned no real token: %v", body)
+	}
+	status, _ = doJSON(t, server, http.MethodGet, "/api/me", token, nil)
+	if status != http.StatusOK {
+		t.Fatalf("/api/me with 2FA token: status %d", status)
+	}
+
+	// Same device again → 2FA skipped.
+	status, body = doJSON(t, server, http.MethodPost, "/api/login", "",
+		map[string]string{"email": email, "password": password, "deviceId": "dev-1"})
+	if status != http.StatusOK || body["twoFactorRequired"] == true {
+		t.Fatalf("trusted-device login: status %d, body %v", status, body)
+	}
+	if token2, _ := body["token"].(string); token2 == "" || token2 == pending {
+		t.Fatalf("trusted-device login returned no real token: %v", body)
 	}
 }
